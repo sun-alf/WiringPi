@@ -84,6 +84,7 @@
 
 #define	ENV_DEBUG	"WIRINGPI_DEBUG"
 #define	ENV_CODES	"WIRINGPI_CODES"
+#define	ENV_GPIOMEM	"WIRINGPI_GPIOMEM"
 
 
 // Mask for the bottom 64 pins which belong to the Raspberry Pi
@@ -130,13 +131,16 @@ struct wiringPiNodeStruct *wiringPiNodes = NULL ;
 // Access from ARM Running Linux
 //	Taken from Gert/Doms code. Some of this is not in the manual
 //	that I can find )-:
+//
+// Updates in September 2015 - all now static variables (and apologies for the caps)
+//	due to the Pi v2 and the new /dev/gpiomem interface
 
-static volatile unsigned int	 BCM2708_PERI_BASE = 0x20000000 ;	// Variable for Pi2
-#define GPIO_PADS		(BCM2708_PERI_BASE + 0x00100000)
-#define CLOCK_BASE		(BCM2708_PERI_BASE + 0x00101000)
-#define GPIO_BASE		(BCM2708_PERI_BASE + 0x00200000)
-#define GPIO_TIMER		(BCM2708_PERI_BASE + 0x0000B000)
-#define GPIO_PWM		(BCM2708_PERI_BASE + 0x0020C000)
+static volatile unsigned int RASPBERRY_PI_PERI_BASE ;
+static volatile unsigned int GPIO_PADS ;
+static volatile unsigned int GPIO_CLOCK_BASE ;
+static volatile unsigned int GPIO_BASE ;
+static volatile unsigned int GPIO_TIMER ;
+static volatile unsigned int GPIO_PWM ;
 
 #define	PAGE_SIZE		(4*1024)
 #define	BLOCK_SIZE		(4*1024)
@@ -250,6 +254,10 @@ static pthread_mutex_t pinMutex ;
 int wiringPiDebug       = FALSE ;
 int wiringPiReturnCodes = FALSE ;
 
+// Use /dev/gpiomem ?
+
+int wiringPiTryGpioMem  = FALSE ;
+
 // sysFds:
 //	Map a file descriptor from the /sys/class/gpio/gpioX/value
 
@@ -263,8 +271,7 @@ static int sysFds [64] =
 
 // ISR Data
 
-static void (*isrFunctions [64])(void*) ;
-static void *isrFunctionArgumets [64];
+static void (*isrFunctions [64])(void) ;
 
 
 // Doing it the Arduino way with lookup tables...
@@ -629,6 +636,7 @@ int wiringPiFailure (int fatal, const char *message, ...)
  *	0011 - Pi CM,    Rev 1.2, 512MB, Sony
  *	0012 - Model A+  Rev 1.2, 256MB, Sony
  *	0014 - Pi CM,    Rev 1.1, 512MB, Sony (Actual Revision might be different)
+ *	0015 - Model A+  Rev 1.1, 256MB, Sony
  *
  *	For the Pi 2:
  *	0010 - Model 2, Rev 1.1, Quad Core, 1GB, Sony
@@ -686,7 +694,11 @@ int piBoardRev (void)
   else if (strstr (line, "BCM2708") == NULL)
   {
     fprintf (stderr, "Unable to determine hardware version. I see: %s,\n", line) ;
-    fprintf (stderr, " - expecting BCM2708 or BCM2709. Please report this to projects@drogon.net\n") ;
+    fprintf (stderr, " - expecting BCM2708 or BCM2709.\n") ;
+    fprintf (stderr, "If this is a genuine Raspberry Pi then please report this\n") ;
+    fprintf (stderr, "to projects@drogon.net. If this is not a Raspberry Pi then you\n") ;
+    fprintf (stderr, "are on your own as wiringPi is designed to support the\n") ;
+    fprintf (stderr, "Raspberry Pi ONLY.\n") ;
     exit (EXIT_FAILURE) ;
   }
 
@@ -861,6 +873,7 @@ void piBoardId (int *model, int *rev, int *mem, int *maker, int *overVolted)
     else if (strcmp (c, "0012") == 0) { *model = PI_MODEL_AP ; *rev = PI_VERSION_1_2 ; *mem = 256 ; *maker = PI_MAKER_SONY   ; }
     else if (strcmp (c, "0013") == 0) { *model = PI_MODEL_BP ; *rev = PI_VERSION_1_2 ; *mem = 512 ; *maker = PI_MAKER_MBEST  ; }
     else if (strcmp (c, "0014") == 0) { *model = PI_MODEL_CM ; *rev = PI_VERSION_1_2 ; *mem = 512 ; *maker = PI_MAKER_SONY   ; }
+    else if (strcmp (c, "0015") == 0) { *model = PI_MODEL_AP ; *rev = PI_VERSION_1_1 ; *mem = 256 ; *maker = PI_MAKER_SONY   ; }
     else                              { *model = 0           ; *rev = 0              ; *mem =   0 ; *maker = 0 ;               }
   }
 }
@@ -905,6 +918,9 @@ void setPadDrive (int group, int value)
 
   if ((wiringPiMode == WPI_MODE_PINS) || (wiringPiMode == WPI_MODE_PHYS) || (wiringPiMode == WPI_MODE_GPIO))
   {
+    if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+      return ;
+
     if ((group < 0) || (group > 2))
       return ;
 
@@ -978,6 +994,9 @@ void pwmSetRange (unsigned int range)
 {
   if ((wiringPiMode == WPI_MODE_PINS) || (wiringPiMode == WPI_MODE_PHYS) || (wiringPiMode == WPI_MODE_GPIO))
   {
+    if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+      return ;
+
     *(pwm + PWM0_RANGE) = range ; delayMicroseconds (10) ;
     *(pwm + PWM1_RANGE) = range ; delayMicroseconds (10) ;
   }
@@ -999,6 +1018,9 @@ void pwmSetClock (int divisor)
 
   if ((wiringPiMode == WPI_MODE_PINS) || (wiringPiMode == WPI_MODE_PHYS) || (wiringPiMode == WPI_MODE_GPIO))
   {
+    if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+      return ;
+
     if (wiringPiDebug)
       printf ("Setting to: %d. Current: 0x%08X\n", divisor, *(clk + PWMCLK_DIV)) ;
 
@@ -1051,6 +1073,9 @@ void gpioClockSet (int pin, int freq)
   else if (wiringPiMode != WPI_MODE_GPIO)
     return ;
   
+  if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+    return ;
+
   divi = 19200000 / freq ;
   divr = 19200000 % freq ;
   divf = (int)((double)divr * 4096.0 / 19200000.0) ;
@@ -1223,11 +1248,17 @@ void pinMode (int pin, int mode)
       softToneCreate (origPin) ;
     else if (mode == PWM_TONE_OUTPUT)
     {
+      if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+	return ;
+
       pinMode (origPin, PWM_OUTPUT) ;	// Call myself to enable PWM mode
       pwmSetMode (PWM_MODE_MS) ;
     }
     else if (mode == PWM_OUTPUT)
     {
+      if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+	return ;
+
       if ((alt = gpioToPwmALT [pin]) == 0)	// Not a hardware capable PWM pin
 	return ;
 
@@ -1242,6 +1273,9 @@ void pinMode (int pin, int mode)
     }
     else if (mode == GPIO_CLOCK)
     {
+      if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+	return ;
+
       if ((alt = gpioToGpClkALT0 [pin]) == 0)	// Not a GPIO_CLOCK pin
 	return ;
 
@@ -1396,6 +1430,9 @@ void pwmWrite (int pin, int value)
 
   if ((pin & PI_GPIO_MASK) == 0)		// On-Board Pin
   {
+    if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+      return ;
+
     /**/ if (wiringPiMode == WPI_MODE_PINS)
       pin = pinToGpio [pin] ;
     else if (wiringPiMode == WPI_MODE_PHYS)
@@ -1461,6 +1498,9 @@ void analogWrite (int pin, int value)
 void pwmToneWrite (int pin, int freq)
 {
   int range ;
+
+  if (RASPBERRY_PI_PERI_BASE == 0)	// Ignore for now
+    return ;
 
   if (freq == 0)
     pwmWrite (pin, 0) ;             // Off
@@ -1582,7 +1622,7 @@ static void *interruptHandler (void *arg)
 
   for (;;)
     if (waitForInterrupt (myPin, -1) > 0)
-      isrFunctions [myPin] (isrFunctionArgumets [myPin]) ;
+      isrFunctions [myPin] () ;
 
   return NULL ;
 }
@@ -1596,7 +1636,7 @@ static void *interruptHandler (void *arg)
  *********************************************************************************
  */
 
-int wiringPiISR (int pin, int mode, void (*function)(void*), void *argumet)
+int wiringPiISR (int pin, int mode, void (*function)(void))
 {
   pthread_t threadId ;
   const char *modeS ;
@@ -1675,7 +1715,6 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void *argumet)
     read (sysFds [bcmGpioPin], &c, 1) ;
 
   isrFunctions [pin] = function ;
-  isrFunctionArgumets [pin] = argumet ;
 
   pthread_mutex_lock (&pinMutex) ;
     pinPass = pin ;
@@ -1831,11 +1870,15 @@ int wiringPiSetup (void)
   if (getenv (ENV_CODES) != NULL)
     wiringPiReturnCodes = TRUE ;
 
-  if (geteuid () != 0)
-    (void)wiringPiFailure (WPI_FATAL, "wiringPiSetup: Must be root. (Did you forget sudo?)\n") ;
+  if (getenv (ENV_GPIOMEM) != NULL)
+    wiringPiTryGpioMem = TRUE ;
 
   if (wiringPiDebug)
+  {
     printf ("wiringPi: wiringPiSetup called\n") ;
+    if (wiringPiTryGpioMem)
+      printf ("wiringPi: Using /dev/gpiomem\n") ;
+  }
 
   boardRev = piBoardRev () ;
 
@@ -1846,43 +1889,77 @@ int wiringPiSetup (void)
   }
   else 				// A, B, Rev 2, B+, CM, Pi2
   {
-    if (piModel2)
-      BCM2708_PERI_BASE = 0x3F000000 ;
      pinToGpio =  pinToGpioR2 ;
     physToGpio = physToGpioR2 ;
   }
 
-// Open the master /dev/memory device
+  if (piModel2)
+    RASPBERRY_PI_PERI_BASE = 0x3F000000 ;
+  else
+    RASPBERRY_PI_PERI_BASE = 0x20000000 ;
 
-  if ((fd = open ("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC) ) < 0)
-    return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: Unable to open /dev/mem: %s\n", strerror (errno)) ;
+// Open the master /dev/ memory control device
 
-// GPIO:
+//	See if /dev/gpiomem exists and we can open it...
+
+  if (wiringPiTryGpioMem)
+  {
+    if ((fd = open ("/dev/gpiomem", O_RDWR | O_SYNC | O_CLOEXEC) ) < 0)
+      return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: Unable to open /dev/gpiomem: %s\n", strerror (errno)) ;
+    RASPBERRY_PI_PERI_BASE = 0 ;
+  }
+
+//	... otherwise fall back to the original /dev/mem which requires root level access
+
+  else
+  {
+
+//	This check is here because people are too stupid to check for themselves or read
+//		error messages.
+
+    if (geteuid () != 0)
+      (void)wiringPiFailure (WPI_FATAL, "wiringPiSetup: Must be root. (Did you forget sudo?)\n") ;
+
+    if ((fd = open ("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC) ) < 0)
+      return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: Unable to open /dev/mem: %s\n", strerror (errno)) ;
+  }
+
+// Set the offsets into the memory interface.
+
+  GPIO_PADS 	  = RASPBERRY_PI_PERI_BASE + 0x00100000 ;
+  GPIO_CLOCK_BASE = RASPBERRY_PI_PERI_BASE + 0x00101000 ;
+  GPIO_BASE	  = RASPBERRY_PI_PERI_BASE + 0x00200000 ;
+  GPIO_TIMER	  = RASPBERRY_PI_PERI_BASE + 0x0000B000 ;
+  GPIO_PWM	  = RASPBERRY_PI_PERI_BASE + 0x0020C000 ;
+
+// Map the individual hardware components
+
+//	GPIO:
 
   gpio = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_BASE) ;
   if ((int32_t)gpio == -1)
     return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: mmap (GPIO) failed: %s\n", strerror (errno)) ;
 
-// PWM
+//	PWM
 
   pwm = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_PWM) ;
   if ((int32_t)pwm == -1)
     return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: mmap (PWM) failed: %s\n", strerror (errno)) ;
  
-// Clock control (needed for PWM)
+//	Clock control (needed for PWM)
 
-  clk = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, CLOCK_BASE) ;
+  clk = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_CLOCK_BASE) ;
   if ((int32_t)clk == -1)
     return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: mmap (CLOCK) failed: %s\n", strerror (errno)) ;
  
-// The drive pads
+//	The drive pads
 
   pads = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_PADS) ;
   if ((int32_t)pads == -1)
     return wiringPiFailure (WPI_ALMOST, "wiringPiSetup: mmap (PADS) failed: %s\n", strerror (errno)) ;
 
 #ifdef	USE_TIMER
-// The system timer
+//	The system timer
 
   timer = (uint32_t *)mmap(0, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, GPIO_TIMER) ;
   if ((int32_t)timer == -1)
